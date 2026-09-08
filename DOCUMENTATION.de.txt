@@ -29,3 +29,24 @@ Contract:
 - App-Klasse: `console`
 - Platform-API-Imports: `R4SYS:Query:1`, `R4NET:Query:1`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\RECV.R4X`
+
+
+Stand 0.78.60 / RECV 0.1.2
+-------------------------
+Empfang erfolgt in einer eigenen gleichgeordneten 8.3-Temporaerdatei. Der
+bisherige Zielinhalt wird erst nach vollstaendigem Empfang, Pruefsumme und
+bestaetigtem Stream-Abschluss ueber die atomare Speicherfassade ersetzt.
+Abbrueche bereinigen nur den anfrageeigenen Stream. Ein Fehler waehrend der
+Veroeffentlichung behaelt die benoetigten Wiederherstellungsdateien und
+meldet deren Namen; die vorhandenen Dateisystemgrenzen bleiben massgeblich.
+
+/RESUME kopiert den alten Teilbestand in den Stream und fordert dessen Rest
+an. Nach einem Fehler bleibt derselbe alte Teilbestand fuer den naechsten
+Versuch erhalten. /NOOVERWRITE verhindert einen normalen Ersatz auch mit
+aktiviertem /RESUME; ein ausdruecklicher Resume darf den Teilbestand nach
+vollstaendiger Pruefung vervollstaendigen. Fehlende leere Resume-Ziele werden
+angelegt. Ueberlange Dezimalwerte werden ohne arithmetischen Ueberlauf
+abgewiesen. R4SEND1 und R4SEND2 bleiben kompatibel.
+
+RECV oeffnet seinen Listener vor Accept und schliesst ihn auf jedem Rueckweg.
+Die Wartemeldung bestaetigt die erfolgreiche Listeneraufnahme.
