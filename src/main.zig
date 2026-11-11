@@ -1,9 +1,9 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const MAX_PACKET: usize = r4os.abi.net_service_tcp_read_max;
 const MAX_FILE: usize = 512 * 1024;
 const MAX_PATH: usize = 128;
-const BODY_WAIT_MS: u64 = 3000;
 
 const Packet = struct {
     name: []const u8,
@@ -22,40 +22,20 @@ const Options = struct {
 };
 
 const App = struct {
+    app: *r4os.App2,
     sys: r4os.r4sys.Context,
-    net: r4os.r4net.Context,
-
-    fn init(r4_app: *r4os.App) ?App {
-        return .{
-            .sys = r4_app.system(),
-            .net = r4_app.networkLowLevel() orelse return null,
-        };
-    }
-
-    fn argsRaw(self: *const App) [*:0]const u8 {
-        return self.sys.argsRaw();
-    }
+    output: *r4os.launch_io.Output,
+    network: *r4os.network_stream.Session,
+    budget: *r4os.rpc_budget.Budget,
+    args: []const u8,
+    family: u32,
 
     fn write(self: *const App, value: []const u8) void {
-        self.sys.write(value);
+        self.output.write(value);
     }
-
     fn printU64(self: *const App, value: u64) void {
-        self.sys.printU64(value);
+        self.output.number(value);
     }
-
-    fn ticksFromMilliseconds(self: *const App, ms: u64) u64 {
-        return self.sys.ticksFromMilliseconds(ms);
-    }
-
-    fn fileInfo(self: *const App, path: [*:0]const u8) ?r4os.abi.FileInfo {
-        return self.sys.fileInfo(path);
-    }
-
-    fn fileReadAt(self: *const App, path: [*:0]const u8, offset: u32, out: []u8) i32 {
-        return self.sys.fileReadAt(path, offset, out);
-    }
-
     fn fileDelete(self: *const App, path: [*:0]const u8) i32 {
         return self.sys.fileDelete(path);
     }
@@ -74,10 +54,6 @@ const App = struct {
 
     fn fileStreamBegin(self: *const App, path: [*:0]const u8, flags: u32) i32 {
         return self.sys.fileStreamBegin(path, flags);
-    }
-
-    pub fn fileStreamWrite(self: *const App, path: [*:0]const u8, offset: u64, bytes: []const u8, flags: u32) i32 {
-        return self.sys.fileStreamWrite(path, offset, bytes, flags);
     }
 
     fn fileStreamAbort(self: *const App, path: [*:0]const u8) i32 {
@@ -100,37 +76,40 @@ const App = struct {
             .{ .require_target_absent = create_only, .require_owned_stage = create_only },
         ) == .ok;
     }
-
-    fn tcpAcceptPollReadService(self: *const App, port: u16, out: []u8, result: *r4os.abi.TcpAcceptResult) i32 {
-        return self.net.tcpAcceptPollReadService(port, out, result);
-    }
-
-    fn tcpListenService(self: *const App, port: u16) i32 {
-        return self.net.tcpListenService(port);
-    }
-
-    fn tcpCloseListenService(self: *const App, port: u16) i32 {
-        return self.net.tcpCloseListenService(port);
-    }
-
-    fn tcpWriteService(self: *const App, handle: u32, data: []const u8) i32 {
-        return self.net.tcpWriteService(handle, data);
-    }
-
-    fn tcpReadWaitService(self: *const App, handle: u32, out: []u8, wait_ticks: u64) i32 {
-        return self.net.tcpReadWaitService(handle, out, wait_ticks);
-    }
-
-    fn tcpCloseService(self: *const App, handle: u32) i32 {
-        return self.net.tcpCloseService(handle);
-    }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    const ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const args = trim(zSlice(ctx.argsRaw()));
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    var output: r4os.launch_io.Output = undefined;
+    if (r4os.launch_io.Output.init(app, &output) != 0) return 1;
+    var selected_family: u32 = 0;
+    const args = r4os.network_stream.arguments(app.args(), &selected_family) orelse {
+        output.write("RECV: invalid argument grammar\r\n");
+        _ = output.close();
+        return 1;
+    };
+    var budget = r4os.rpc_budget.Budget.fromTimeout(output.clock.read, .{ .kind = 1, .nanoseconds = 30_000_000_000 }) catch {
+        _ = output.close();
+        return 1;
+    };
+    var network: r4os.network_stream.Session = undefined;
+    const opened = r4os.network_stream.Session.open(app, &budget, &network);
+    if (opened != 0) {
+        output.write("RECV: TCPSVC unavailable or invalid\r\n");
+        _ = output.close();
+        return 1;
+    }
+    const ctx: App = .{ .app = app, .sys = app.system(), .output = &output, .network = &network, .budget = &budget, .args = args, .family = selected_family };
+    const result = run(&ctx);
+    const closed = network.close();
+    if (closed != 0) output.write("RECV close: not confirmed\r\n");
+    const io_closed = output.close();
+    return if (output.failed or closed != 0 or io_closed != 0) 1 else result;
+}
+
+fn run(ctx: *const App) i32 {
+    const args = trim(ctx.args);
     const options = parseOptions(args) orelse {
-        usage(&ctx);
+        usage(ctx);
         return 1;
     };
 
@@ -143,84 +122,84 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
             ctx.printU64(options.retries + 1);
             ctx.write("\r\n");
         }
-        const result = recvOnce(&ctx, options);
+        const result = recvOnce(ctx, options);
         if (result == 0) return 0;
+        if (result == 2 or ctx.network.cleanup_failed or ctx.output.failed) return 1;
+        _ = ctx.budget.remainingTicks() catch return 1;
         if (attempt < options.retries) ctx.write("RECV retry: next\r\n");
     }
     return 1;
 }
 
 fn recvOnce(ctx: *const App, options: Options) i32 {
-    var packet_buf: [MAX_PACKET]u8 = undefined;
-    var accept: r4os.abi.TcpAcceptResult = .{};
-
-    if (ctx.tcpListenService(options.port) != 0) {
-        ctx.write("RECV result: listen-error\r\n");
-        return 1;
-    }
-    defer _ = ctx.tcpCloseListenService(options.port);
-
     ctx.write("RECV listen ");
     ctx.printU64(options.port);
     ctx.write(": waiting\r\n");
-
-    const got = ctx.tcpAcceptPollReadService(options.port, packet_buf[0..], &accept);
-    if (got <= 0 or accept.conn_id == 0) {
-        ctx.write("RECV listen ");
-        ctx.printU64(options.port);
-        ctx.write(": ");
-        ctx.write(if (got == 0) "timeout\r\n" else "failed\r\n");
+    if (ctx.output.failed) return 1;
+    const endpoint: r4os.abi.NetworkEndpoint = .{ .address = .{ .family = if (ctx.family == 6) 6 else 4 }, .port = options.port };
+    var listener: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(endpoint, true, ctx.budget, &listener) != 0) {
+        ctx.write("RECV result: listen-error\r\n");
         return 1;
     }
-
-    defer _ = ctx.tcpCloseService(accept.conn_id);
-
+    defer listener.close();
+    var socket: r4os.network_stream.Socket = undefined;
+    if (listener.accept(ctx.budget, &socket) != 0) {
+        ctx.write("RECV listen: accept failed\r\n");
+        return 1;
+    }
+    defer socket.close();
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
+    var packet_buf: [128]u8 = undefined;
+    const header = (reader.line(&packet_buf, ctx.budget) catch return 1) orelse {
+        ctx.write("RECV result: packet-error\r\n");
+        return 1;
+    };
     ctx.write("RECV accepted: conn=");
-    ctx.printU64(accept.conn_id);
+    ctx.printU64(socket.id);
     ctx.write(" bytes=");
-    ctx.printU64(accept.bytes);
+    ctx.printU64(header.len);
     ctx.write("\r\n");
-
-    const packet = parsePacket(packet_buf[0..@intCast(got)]) orelse {
-        sendError(ctx, accept.conn_id, "packet", 0, 0);
+    const packet = parsePacket(header) orelse {
+        sendError(ctx, &socket, "packet", 0, 0);
         ctx.write("RECV result: packet-error\r\n");
         return 1;
     };
 
     if (packet.size > MAX_FILE) {
-        sendError(ctx, accept.conn_id, "too-large", 0, packet.size);
+        sendError(ctx, &socket, "too-large", 0, packet.size);
         ctx.write("RECV result: too-large\r\n");
         return 1;
     }
 
     var output_buf: [MAX_PATH]u8 = undefined;
     const output = resolveOutputPath(output_buf[0..], options.outfile, packet.name) orelse {
-        sendError(ctx, accept.conn_id, "path", 0, packet.size);
+        sendError(ctx, &socket, "path", 0, packet.size);
         ctx.write("RECV result: path-error\r\n");
         return 1;
     };
     var path_buf: [MAX_PATH:0]u8 = .{0} ** MAX_PATH;
     const path_z = copyZ(path_buf[0..], output) orelse {
-        sendError(ctx, accept.conn_id, "path", 0, packet.size);
+        sendError(ctx, &socket, "path", 0, packet.size);
         ctx.write("RECV result: path-error\r\n");
         return 1;
     };
     var info_value: r4os.abi.FileInfo = .{};
     const info_rc = ctx.fileInfoRaw(path_z, &info_value);
     if (info_rc < 0 or (info_value.exists != 0 and info_value.is_dir != 0)) {
-        sendError(ctx, accept.conn_id, "target", 0, packet.size);
+        sendError(ctx, &socket, "target", 0, packet.size);
         ctx.write("RECV result: target-error\r\n");
         return 1;
     }
     const existing_info: ?r4os.abi.FileInfo = if (info_rc > 0 and info_value.exists != 0) info_value else null;
     if (options.no_overwrite and existing_info != null and !packet.resume_mode) {
-        sendError(ctx, accept.conn_id, "exists", 0, packet.size);
+        sendError(ctx, &socket, "exists", 0, packet.size);
         ctx.write("RECV result: exists\r\n");
         return 1;
     }
 
     if (packet.resume_mode and !options.resume_mode) {
-        sendError(ctx, accept.conn_id, "resume-disabled", 0, packet.size);
+        sendError(ctx, &socket, "resume-disabled", 0, packet.size);
         ctx.write("RECV result: resume-disabled\r\n");
         return 1;
     }
@@ -228,7 +207,7 @@ fn recvOnce(ctx: *const App, options: Options) i32 {
     var stage_buf: [MAX_PATH:0]u8 = .{0} ** MAX_PATH;
     var backup_buf: [MAX_PATH:0]u8 = .{0} ** MAX_PATH;
     if (!createStage(ctx, path_z, &stage_buf, &backup_buf)) {
-        sendError(ctx, accept.conn_id, "stage", 0, packet.size);
+        sendError(ctx, &socket, "stage", 0, packet.size);
         ctx.write("RECV result: stage-error\r\n");
         return 1;
     }
@@ -244,20 +223,20 @@ fn recvOnce(ctx: *const App, options: Options) i32 {
     if (packet.resume_mode) {
         if (existing_info) |info| {
             if (info.is_dir != 0 or info.size > packet.size) {
-                sendError(ctx, accept.conn_id, "resume-size", @intCast(info.size), packet.size);
+                sendError(ctx, &socket, "resume-size", @intCast(info.size), packet.size);
                 ctx.write("RECV result: resume-error\r\n");
                 return 1;
             }
             file_len = @intCast(info.size);
             sum = copyPrefix(ctx, path_z, &writer, file_len) orelse {
-                sendError(ctx, accept.conn_id, "resume-read", file_len, packet.size);
+                sendError(ctx, &socket, "resume-read", file_len, packet.size);
                 ctx.write("RECV result: resume-error\r\n");
                 return 1;
             };
         }
         if (file_len == packet.size and existing_info != null) {
             if (sum != packet.checksum) {
-                sendError(ctx, accept.conn_id, "checksum", file_len, packet.size);
+                sendError(ctx, &socket, "checksum", file_len, packet.size);
                 ctx.write("RECV result: checksum-error\r\n");
                 return 1;
             }
@@ -266,25 +245,26 @@ fn recvOnce(ctx: *const App, options: Options) i32 {
                 ctx.write("RECV result: ack-build-error\r\n");
                 return 1;
             };
-            if (ctx.tcpWriteService(accept.conn_id, ok) != @as(i32, @intCast(ok.len))) {
+            const sent_ok = socket.writeAll(ok, ctx.budget) catch return 1;
+            if (!r4os.network_stream.complete(sent_ok)) {
                 ctx.write("RECV ack: failed\r\n");
                 return 1;
             }
             ctx.write("RECV resume: complete\r\n");
             ctx.write("RECV ack: ");
-            ctx.write(ok);
+            ctx.write(trim(ok));
             ctx.write("\r\n");
             ctx.write("RECV result: ok\r\n");
             return 0;
         }
         var cont_buf: [32]u8 = undefined;
         const cont = buildContinue(cont_buf[0..], file_len) orelse {
-            sendError(ctx, accept.conn_id, "resume", file_len, packet.size);
+            sendError(ctx, &socket, "resume", file_len, packet.size);
             ctx.write("RECV result: resume-error\r\n");
             return 1;
         };
-        const cont_written = ctx.tcpWriteService(accept.conn_id, cont);
-        if (cont_written < 0 or cont_written != @as(i32, @intCast(cont.len))) {
+        const cont_written = socket.writeAll(cont, ctx.budget) catch return 1;
+        if (!r4os.network_stream.complete(cont_written)) {
             ctx.write("RECV resume: cont-failed\r\n");
             return 1;
         }
@@ -293,54 +273,43 @@ fn recvOnce(ctx: *const App, options: Options) i32 {
         ctx.write("\r\n");
     }
 
-    if (packet.body_start < @as(usize, @intCast(got))) {
-        const available = @as(usize, @intCast(got)) - packet.body_start;
-        const copy_len = @min(available, packet.size - file_len);
-        const chunk = packet_buf[packet.body_start .. packet.body_start + copy_len];
-        if (!r4os.file_stream.write(ctx, &writer, chunk)) {
-            sendError(ctx, accept.conn_id, "save", file_len, packet.size);
-            ctx.write("RECV result: save-error\r\n");
-            return 1;
-        }
-        sum = checksumUpdate(sum, chunk);
-        file_len += copy_len;
-    }
-
     var read_buf: [MAX_PACKET]u8 = undefined;
-    const body_wait_ticks = ctx.ticksFromMilliseconds(BODY_WAIT_MS);
     while (file_len < packet.size) {
-        const got_more = ctx.tcpReadWaitService(accept.conn_id, read_buf[0..], body_wait_ticks);
-        if (got_more <= 0) {
-            sendError(ctx, accept.conn_id, "incomplete", file_len, packet.size);
-            ctx.write("RECV result: incomplete\r\n");
-            return 1;
-        }
-        const got_len: usize = @intCast(got_more);
-        const copy_len = @min(got_len, packet.size - file_len);
-        const chunk = read_buf[0..copy_len];
-        if (!r4os.file_stream.write(ctx, &writer, chunk)) {
-            sendError(ctx, accept.conn_id, "save", file_len, packet.size);
+        const want = @min(read_buf.len, packet.size - file_len);
+        const received = reader.read(read_buf[0..want], true, ctx.budget) catch return 1;
+        const chunk = read_buf[0..@intCast(received.bytes)];
+        if (!writeChunk(ctx, &writer, chunk)) {
+            sendError(ctx, &socket, "save", file_len, packet.size);
             ctx.write("RECV result: save-error\r\n");
             return 1;
         }
         sum = checksumUpdate(sum, chunk);
-        file_len += copy_len;
+        file_len += chunk.len;
+        if (!r4os.network_stream.complete(received)) {
+            sendError(ctx, &socket, "incomplete", file_len, packet.size);
+            ctx.write("RECV result: incomplete prefix=");
+            ctx.printU64(file_len);
+            ctx.write("\r\n");
+            return 1;
+        }
     }
 
     if (sum != packet.checksum) {
-        sendError(ctx, accept.conn_id, "checksum", file_len, packet.size);
+        sendError(ctx, &socket, "checksum", file_len, packet.size);
         ctx.write("RECV result: checksum-error\r\n");
         return 1;
     }
 
+    _ = ctx.budget.remainingTicks() catch return 1;
     if (!ctx.finishStage(&writer)) {
-        sendError(ctx, accept.conn_id, "finish", file_len, packet.size);
+        sendError(ctx, &socket, "finish", file_len, packet.size);
         ctx.write("RECV result: finish-error\r\n");
         return 1;
     }
+    _ = ctx.budget.remainingTicks() catch return 1;
     const create_only = options.no_overwrite and (!packet.resume_mode or existing_info == null);
     if (!ctx.publish(path_z, stage, backup, create_only)) {
-        sendError(ctx, accept.conn_id, "publish", file_len, packet.size);
+        sendError(ctx, &socket, "publish", file_len, packet.size);
         ctx.write("RECV result: publish-error; retained paths: ");
         ctx.write(zSlice(stage));
         ctx.write(" ");
@@ -375,21 +344,21 @@ fn recvOnce(ctx: *const App, options: Options) i32 {
         ctx.write("RECV result: ack-build-error\r\n");
         return 1;
     };
-    const written = ctx.tcpWriteService(accept.conn_id, ack);
-    if (written < 0 or written != @as(i32, @intCast(ack.len))) {
-        ctx.write("RECV ack: failed\r\n");
-        return 1;
+    const written = socket.writeAll(ack, ctx.budget) catch return 2;
+    if (!r4os.network_stream.complete(written)) {
+        ctx.write("RECV ack: failed after publication\r\n");
+        return 2;
     }
 
     ctx.write("RECV ack: ");
-    ctx.write(ack);
+    ctx.write(trim(ack));
     ctx.write("\r\n");
     ctx.write("RECV result: ok\r\n");
     return 0;
 }
 
 fn usage(ctx: *const App) void {
-    ctx.write("Usage: RECV port [outfile|dir\\] [/NOOVERWRITE] [/RESUME] [/RETRY n]\r\n");
+    ctx.write("Usage: RECV [-4|-6] port [outfile|dir\\] [/NOOVERWRITE] [/RESUME] [/RETRY n]\r\n");
 }
 
 fn parseOptions(args: []const u8) ?Options {
@@ -480,6 +449,7 @@ fn buildOk(out: []u8, size: usize, sum: u32) ?[]const u8 {
     if (!appendU64(out, &len, size)) return null;
     if (!append(out, &len, " ")) return null;
     if (!appendU64(out, &len, sum)) return null;
+    if (!append(out, &len, "\r\n")) return null;
     return out[0..len];
 }
 
@@ -487,10 +457,11 @@ fn buildContinue(out: []u8, offset: usize) ?[]const u8 {
     var len: usize = 0;
     if (!append(out, &len, "CONT ")) return null;
     if (!appendU64(out, &len, offset)) return null;
+    if (!append(out, &len, "\r\n")) return null;
     return out[0..len];
 }
 
-fn sendError(ctx: *const App, conn_id: u32, code: []const u8, saved: usize, expected: usize) void {
+fn sendError(ctx: *const App, socket: *r4os.network_stream.Socket, code: []const u8, saved: usize, expected: usize) void {
     var buf: [64]u8 = undefined;
     var len: usize = 0;
     if (!append(buf[0..], &len, "ERR ")) return;
@@ -499,13 +470,14 @@ fn sendError(ctx: *const App, conn_id: u32, code: []const u8, saved: usize, expe
     if (!appendU64(buf[0..], &len, saved)) return;
     if (!append(buf[0..], &len, " ")) return;
     if (!appendU64(buf[0..], &len, expected)) return;
-    _ = ctx.tcpWriteService(conn_id, buf[0..len]);
+    if (!append(&buf, &len, "\r\n")) return;
+    _ = socket.writeAll(buf[0..len], ctx.budget) catch return;
 }
 
 fn validName(value: []const u8) bool {
     if (value.len == 0 or value.len > 48) return false;
     for (value) |ch| {
-        if (isSpace(ch) or ch == '/' or ch == '\\' or ch == ':') return false;
+        if (ch < 32 or ch == 127 or ch == '"' or isSpace(ch) or ch == '/' or ch == '\\' or ch == ':') return false;
     }
     return true;
 }
@@ -516,18 +488,40 @@ fn checksumUpdate(seed: u32, data: []const u8) u32 {
     return out;
 }
 
+fn writeChunk(ctx: *const App, writer: *r4os.file_stream.WriterState, bytes: []const u8) bool {
+    if (!writer.active) return false;
+    var sink = r4os.stream_transfer.adapters.FileStream.fromContext2(&ctx.app.context, writer.path, writer.offset) catch return false;
+    const driver: r4os.stream_transfer.adapters.Driver = .{ .sys = ctx.sys, .clock = &ctx.network.clock, .budget = ctx.budget };
+    const progress = driver.write(bytes, MAX_PACKET, r4os.stream_transfer.adapters.FileStream.step, &sink) catch return false;
+    writer.offset += progress.bytes;
+    writer.error_code = progress.error_code;
+    return r4os.network_stream.complete(progress);
+}
+
 fn copyPrefix(ctx: *const App, path: [*:0]const u8, writer: *r4os.file_stream.WriterState, size: usize) ?u32 {
+    const before = switch (r4os.metadata2.info(&ctx.app.context, path)) {
+        .found => |value| value,
+        else => return null,
+    };
+    if (before.flags & r4os.abi.file_metadata2_flag_byte_size_valid == 0 or before.byte_size != size) return null;
+    var source = r4os.stream_transfer.adapters.FileRead.fromContext2(&ctx.app.context, path, 0) catch return null;
+    const driver: r4os.stream_transfer.adapters.Driver = .{ .sys = ctx.sys, .clock = &ctx.network.clock, .budget = ctx.budget };
     var sum: u32 = 0;
     var offset: usize = 0;
     var buf: [MAX_PACKET]u8 = undefined;
     while (offset < size) {
         const want = @min(buf.len, size - offset);
-        const got = ctx.fileReadAt(path, @intCast(offset), buf[0..want]);
-        if (got < 0 or got != @as(i32, @intCast(want))) return null;
-        if (!r4os.file_stream.write(ctx, writer, buf[0..want])) return null;
+        source.base_offset = offset;
+        const result = driver.read(buf[0..want], MAX_PACKET, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return null;
+        if (!r4os.network_stream.complete(result) or !writeChunk(ctx, writer, buf[0..want])) return null;
         sum = checksumUpdate(sum, buf[0..want]);
         offset += want;
     }
+    const after = switch (r4os.metadata2.info(&ctx.app.context, path)) {
+        .found => |value| value,
+        else => return null,
+    };
+    if (!std.meta.eql(before, after)) return null;
     return sum;
 }
 
@@ -592,26 +586,19 @@ fn appendU64(out: []u8, len: *usize, value: u64) bool {
     return append(out, len, digits[digits.len - count ..]);
 }
 
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
+const Token = struct { token: []const u8, rest: []const u8 };
 fn takeToken(value: []const u8) ?Token {
-    const trimmed = trim(value);
-    if (trimmed.len == 0) return null;
-    var end: usize = 0;
-    while (end < trimmed.len and !isSpace(trimmed[end])) : (end += 1) {}
-    return .{
-        .token = trimmed[0..end],
-        .rest = if (end >= trimmed.len) "" else trim(trimmed[end..]),
-    };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(value, .{}, &failure) catch return null;
+    const token = (cursor.next() catch return null) orelse return null;
+    return .{ .token = token.bytes(value) catch return null, .rest = cursor.remainingArguments() catch return null };
 }
 
 fn parsePort(value: []const u8) ?u16 {
-    const parsed = parseU32(value) orelse return null;
-    if (parsed == 0 or parsed > 65535) return null;
-    return @intCast(parsed);
+    if (value.len == 0) return null;
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u16, value, 10) catch return null;
+    return if (number == 0) null else number;
 }
 
 fn parseU32(value: []const u8) ?u32 {
@@ -621,9 +608,10 @@ fn parseU32(value: []const u8) ?u32 {
 }
 
 fn parseUsize(value: []const u8) ?usize {
-    const parsed = parseU64(value) orelse return null;
-    if (parsed > MAX_FILE) return null;
-    return @intCast(parsed);
+    if (value.len == 0) return null;
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(usize, value, 10) catch return null;
+    return number;
 }
 
 fn parseRetry(value: []const u8) ?u32 {
@@ -634,14 +622,9 @@ fn parseRetry(value: []const u8) ?u32 {
 
 fn parseU64(value: []const u8) ?u64 {
     if (value.len == 0) return null;
-    var out: u64 = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        const digit: u64 = ch - '0';
-        if (out > (@import("std").math.maxInt(u64) - digit) / 10) return null;
-        out = out * 10 + digit;
-    }
-    return out;
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u64, value, 10) catch return null;
+    return number;
 }
 
 fn indexOfCrlf(value: []const u8) ?usize {
@@ -684,4 +667,16 @@ fn bytesEqual(a: []const u8, b: []const u8) bool {
         if (a[i] != b[i]) return false;
     }
     return true;
+}
+
+test "migration recv preserves payload format and frames split control records" {
+    const packet = parsePacket("R4SEND1 Grüße.bin 3 294\r\nabc").?;
+    try std.testing.expectEqualStrings("Grüße.bin", packet.name);
+    try std.testing.expectEqual(@as(usize, 3), packet.size);
+    try std.testing.expectEqual(@as(u32, 294), packet.checksum);
+    try std.testing.expect(!packet.resume_mode);
+    try std.testing.expect(parsePacket("R4SEND1 x.bin 999999999999999999999999 1\r\n") == null);
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("OK 3 294\r\n", buildOk(&buffer, 3, 294).?);
+    try std.testing.expectEqualStrings("CONT 12\r\n", buildContinue(&buffer, 12).?);
 }
