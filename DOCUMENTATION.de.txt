@@ -94,4 +94,10 @@ bisherigen Tokeninhalte und Dateinutzdaten bleiben erhalten. Das erlaubt
 Eindeutigkeit bei ueber mehrere TCP-Reads aufgeteilten Antworten. Bestehende
 SEND-Verbraucher trimmen diesen Abschluss. Ein unbestaetigtes ACK nach
 Veroeffentlichung fuehrt zum Fehlerexit und beendet automatische Versuche.
-Resume-Praefixe werden mit breiten Metadaten vor und nach der Kopie geprueft.
+Vorhandene Resume-Praefixe werden zuerst vollstaendig in einen eigenen
+Speicherpuffer von hoechstens512KB gelesen und anhand der ganzen Metadaten
+vor und nach dem Lesen geprueft. Danach wird dieser Puffer in den Stage
+uebertragen. Eigene Stagewrites publizieren globale Namespaceaenderungen.
+Die Identitaetspruefung erhaelt alle bescheinigten Felder. Der VFS-Vertrag
+beschreibt eine konservative Beobachtung. Eine Inhaltsrevision und ein
+atomarer Dateisnapshot benoetigen den jeweiligen ausdruecklichen Anbieterbeleg.

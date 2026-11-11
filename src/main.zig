@@ -504,25 +504,22 @@ fn copyPrefix(ctx: *const App, path: [*:0]const u8, writer: *r4os.file_stream.Wr
         else => return null,
     };
     if (before.flags & r4os.abi.file_metadata2_flag_byte_size_valid == 0 or before.byte_size != size) return null;
+    const allocator = ctx.app.allocator() orelse return null;
+    const snapshot = allocator.alloc(u8, size) catch return null;
+    defer allocator.free(snapshot);
     var source = r4os.stream_transfer.adapters.FileRead.fromContext2(&ctx.app.context, path, 0) catch return null;
     const driver: r4os.stream_transfer.adapters.Driver = .{ .sys = ctx.sys, .clock = &ctx.network.clock, .budget = ctx.budget };
-    var sum: u32 = 0;
-    var offset: usize = 0;
-    var buf: [MAX_PACKET]u8 = undefined;
-    while (offset < size) {
-        const want = @min(buf.len, size - offset);
-        source.base_offset = offset;
-        const result = driver.read(buf[0..want], MAX_PACKET, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return null;
-        if (!r4os.network_stream.complete(result) or !writeChunk(ctx, writer, buf[0..want])) return null;
-        sum = checksumUpdate(sum, buf[0..want]);
-        offset += want;
-    }
+    const result = driver.read(snapshot, MAX_PACKET, r4os.stream_transfer.adapters.FileRead.step, &source, true) catch return null;
+    if (!r4os.network_stream.complete(result)) return null;
     const after = switch (r4os.metadata2.info(&ctx.app.context, path)) {
         .found => |value| value,
         else => return null,
     };
     if (!std.meta.eql(before, after)) return null;
-    return sum;
+    // Stage writes publish a global namespace change. Complete source
+    // validation before beginning those writes, retaining every identity field.
+    if (!writeChunk(ctx, writer, snapshot)) return null;
+    return checksumUpdate(0, snapshot);
 }
 
 var stage_sequence: u32 = 0;
